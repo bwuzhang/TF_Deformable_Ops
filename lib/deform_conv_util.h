@@ -40,7 +40,7 @@ inline TensorShape Slice(const TensorShape &shape, int start, int end) {
 
 struct DeformConvParam {
     DeformConvParam(TShape kernel, TShape stride,
-                    TShape pad, TShape rates, int num_group, int num_filter,
+                    TShape pad, TShape rates, int num_group,
                     bool no_bias): kernel(kernel), stride(stride), pad(pad), num_group(num_group), num_filter(num_filter), no_bias(no_bias), rates(rates) {};
     TShape kernel, stride, pad, rates;
     int num_group;
@@ -48,5 +48,14 @@ struct DeformConvParam {
     bool no_bias;
 };
 
+struct DeformPoolParam {
+    DeformPoolParam(TShape kernel, TShape stride,
+                    TShape pad, TShape rates, int num_group, int pool_size,
+                    bool no_bias):  stride(stride), pad(pad), num_group(num_group), num_filter(num_filter), pool_size(pool_size), no_bias(no_bias), rates(rates) {};
+    TShape stride, pad, rates;
+    int num_group;
+    int pool_size;
+    bool no_bias;
+};
 
 }

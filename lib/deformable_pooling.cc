@@ -48,12 +48,12 @@ using shape_inference::DimensionHandle;
 using shape_inference::InferenceContext;
 using shape_inference::ShapeHandle;
 
-REGISTER_OP("DeformConvOp").Input("x: T")
-.Input("filter: T")
+REGISTER_OP("DeformPoolOp").Input("x: T")
 .Input("offset: T")
 .Output("output: T")
 .Attr("T: {half, float, double}")
 .Attr("strides: list(int)")
+.Attr("pool_size: int")
 .Attr("rates: list(int)")
 .Attr("num_groups: int")
 .Attr(GetPaddingAttrString())
@@ -94,6 +94,9 @@ REGISTER_OP("DeformConvOp").Input("x: T")
 
     int groups;
     TF_RETURN_IF_ERROR(c->GetAttr("num_groups", &groups));
+
+    int pool_size;
+    TF_RETURN_IF_ERROR(c->GetAttr("pool_size", &pool_size))
 
     DimensionHandle batch_size_dim = c->Dim(input_shape, 0);
     DimensionHandle in_rows_dim = c->Dim(input_shape, 2);
@@ -150,8 +153,7 @@ only support NCHW now
 )doc");
 
 
-REGISTER_OP("DeformConvBackpropOp").Input("x: T")
-.Input("filter: T")
+REGISTER_OP("DeformPoolBackpropOp").Input("x: T")
 .Input("offset: T")
 .Input("out_grad: T")
 .Output("x_grad: T")
@@ -161,6 +163,7 @@ REGISTER_OP("DeformConvBackpropOp").Input("x: T")
 .Attr("strides: list(int)")
 .Attr("rates: list(int)")
 .Attr("num_groups: int")
+.Attr("pool_size: int")
 .Attr(GetPaddingAttrString())
 .Attr("data_format: { 'NHWC', 'NCHW' } = 'NCHW' ")
 .SetShapeFn([](InferenceContext* c) {
@@ -344,9 +347,9 @@ struct LaunchBatchMatMul {
 }
 
 template <typename Device, typename T>
-class DeformConvOp : public OpKernel {
+class DeformPoolOp : public OpKernel {
 public:
-    explicit DeformConvOp(OpKernelConstruction* context) : OpKernel(context) {
+    explicit DeformPoolOp(OpKernelConstruction* context) : OpKernel(context) {
         OP_REQUIRES_OK(context, context->GetAttr("strides", &strides_));
         OP_REQUIRES_OK(context, context->GetAttr("rates", &rates_));
         string data_format;
@@ -367,6 +370,7 @@ public:
         const int64 stride_H = GetTensorDim(strides_, data_format_, 'H');
         const int64 stride_W = GetTensorDim(strides_, data_format_, 'W');
         OP_REQUIRES_OK(context, context->GetAttr("num_groups", &num_groups));
+        OP_REQUIRES_OK(context, context->GetAttr("pool_size", &pool_size))
 
     }
 
@@ -378,45 +382,22 @@ public:
 
     const Tensor& input = context->input(0);
     const TensorShape& ishape = input.shape();
-    // Input filter is of the following dimensions:
-    // [ out_depth, in_depth, filter_rows, filter_cols]
-    const Tensor& filter = context->input(1);
 
-    const Tensor& offset = context->input(2);
+    const Tensor& offset = context->input(1);
     const TensorShape& offset_shape = offset.shape();
-    int num_filter = filter.dim_size(0);
-    // param_->num_filter = depth_out;
+
     // For 2D convolution, there should be 4 dimensions.
     OP_REQUIRES(context, input.dims() == 4,
                 errors::InvalidArgument("input must be 4-dimensional",
                                         input.shape().DebugString()));
-    OP_REQUIRES(context, filter.dims() == 4,
-                errors::InvalidArgument("filter must be 4-dimensional: ",
-                                        filter.shape().DebugString()));
     OP_REQUIRES(context, offset.dims() == 4,
                 errors::InvalidArgument("offset must be 4-dimensional: ",
-                                        filter.shape().DebugString()));
-    for (int i = 0; i < 3; i++) {
-        OP_REQUIRES(context, FastBoundsCheck(filter.dim_size(i),
-                                             std::numeric_limits<int>::max()),
-                    errors::InvalidArgument("filter too large"));
+                                        offset.shape().DebugString()));
     }
 
     // The last dimension for input is in_depth. It must be the same as the
     // filter's in_depth.
     const int64 in_depth = GetTensorDim(input, data_format_, 'C');
-    OP_REQUIRES(
-        context, in_depth == filter.dim_size(1)* num_groups,
-        errors::InvalidArgument("input and filter must have the same depth: ",
-                                in_depth, " vs ", filter.dim_size(1)));
-    OP_REQUIRES(
-        context, offset_shape.dim_size(1) % (filter.dim_size(2) * filter.dim_size(3)) == 0,
-        errors::InvalidArgument("offset channels must divide deformable group size: ",
-                                offset_shape.dim_size(1), " vs ", filter.dim_size(2) * filter.dim_size(3)));
-    OP_REQUIRES(
-        context, num_filter % num_groups == 0,
-        errors::InvalidArgument("num_filter must divide deformable group size: ",
-                                filter.dim_size(0), " vs ", num_groups));
 
     // The second dimension for input is rows/height.
     // The first dimension for filter is rows/height.
@@ -425,7 +406,6 @@ public:
                                          std::numeric_limits<int>::max()),
                 errors::InvalidArgument("Input rows too large"));
     const int input_rows = static_cast<int>(input_rows_raw);
-    const int filter_rows = static_cast<int>(filter.dim_size(2));
 
     // The third dimension for input is columns/width.
     // The second dimension for filter is columns/width.
@@ -434,7 +414,6 @@ public:
                                          std::numeric_limits<int>::max()),
                 errors::InvalidArgument("Input cols too large"));
     const int input_cols = static_cast<int>(input_cols_raw);
-    const int filter_cols = static_cast<int>(filter.dim_size(3));
 
     // The first dimension for input is batch.
     const int64 batch_raw = GetTensorDim(input, data_format_, 'N');
@@ -459,44 +438,13 @@ public:
                                          padding_, &out_cols, &pad_cols));
     TShape pad({static_cast<int>(pad_rows), static_cast<int>(pad_cols)});
     TShape stride({stride_rows, stride_cols});
-    TShape kernels({filter_rows, filter_cols});
     TShape rates({rate_rows, rate_cols});
-    TensorShape out_shape = ShapeFromFormat(data_format_, batch, out_rows, out_cols, num_filter);
-    auto temp = DeformConvParam(kernels, stride, pad, rates, num_groups, num_filter, true);
+    TensorShape out_shape = ShapeFromFormat(data_format_, batch, out_rows, out_cols);
+    auto temp = DeformPoolParam(kernels, stride, pad, rates, num_groups, pool_size, true);
     this->param_ = &temp;
     // LOG(INFO)<<"rates "<<(this->param_->rates)[0]<<" "<<(this->param_->rates)[1];
     LayerSetUp(ishape, offset_shape, out_shape);
 
-    int M = conv_out_channels_ / group_;
-    int N = conv_out_spatial_dim_;
-    int K = kernel_dim_;
-    Tensor weight_3d;
-    OP_REQUIRES(context,
-            weight_3d.CopyFrom(filter, TensorShape({group_, M, K})), errors::InvalidArgument("shape doesn't match"));
-    const T* weight_3d_ptr = weight_3d.template flat<T>().data();
-    Tensor* output_4d = nullptr;
-    OP_REQUIRES_OK(context, context->allocate_output(0, out_shape, &output_4d));
-    T* output_4d_ptr = output_4d->template flat<T>().data();
-    // this two shape size are equal
-    auto col_buf_3d_shape = TensorShape({group_, K, N});
-    auto col_buf_shape = TensorShape({conv_in_channels_*param_->kernel[0]*param_->kernel[1], out_rows, out_cols});
-    Tensor col_buffer_3d;
-    OP_REQUIRES_OK(context, context->allocate_temp(DataTypeToEnum<T>::value, col_buf_3d_shape, &col_buffer_3d));
-    auto in_data_ptr = input.template flat<T>().data();
-    auto offset_ptr = offset.template flat<T>().data();
-    auto col_buffer_3d_ptr = col_buffer_3d.template flat<T>().data();
-    const Device& d = context->eigen_device<Device>();
-
-    for (int n = 0; n <num_; ++n) {
-        // transform image to col_buffer_3d in order to use gemm
-        functor::deformable_im2col<Device, T>()(d, in_data_ptr + n*input_dim_,
-                          offset_ptr + n*input_offset_dim_, ToVector(ishape),
-                          ToVector(col_buf_shape), (this->param_->kernel), (this->param_->pad), (this->param_->stride), (this->param_->rates), 1,
-                          col_buffer_3d_ptr);
-        // Tensor output_3d = output_4d->Slice(n, n+1);
-        T* output_3d_ptr = output_4d_ptr + n * output_dim_;
-        functor::LaunchBatchMatMul<T>::Launch(context, weight_3d.shape(), col_buffer_3d.shape(), weight_3d_ptr, col_buffer_3d_ptr, false, false, output_3d_ptr);
-    }
 
 
 
@@ -572,6 +520,7 @@ public:
         int num_kernels_im2col_;
         int num_kernels_col2im_;
         int num_groups;
+        int pool_size;
         bool bias_term_;  // has bias term?
         bool is_1x1_;
 
@@ -585,9 +534,9 @@ public:
 
 
 template <typename Device, typename T>
-class DeformConvBackpropOp : public OpKernel {
+class DeformPoolBackpropOp : public OpKernel {
  public:
-  explicit DeformConvBackpropOp(OpKernelConstruction* context)
+  explicit DeformPoolBackpropOp(OpKernelConstruction* context)
       : OpKernel(context) {
         OP_REQUIRES_OK(context, context->GetAttr("strides", &strides_));
         OP_REQUIRES_OK(context, context->GetAttr("rates", &rates_));
@@ -609,6 +558,7 @@ class DeformConvBackpropOp : public OpKernel {
         const int64 stride_H = GetTensorDim(strides_, data_format_, 'H');
         const int64 stride_W = GetTensorDim(strides_, data_format_, 'W');
         OP_REQUIRES_OK(context, context->GetAttr("num_groups", &num_groups));
+        OP_REQUIRES_OK(context, context->GetAttr("pool_size", &pool_size));
   }
 
   void Compute(OpKernelContext* context) override {
@@ -655,7 +605,7 @@ class DeformConvBackpropOp : public OpKernel {
     TShape stride({stride_rows, stride_cols});
     TShape kernels({filter_rows, filter_cols});
     TShape rates({rate_rows, rate_cols});
-    auto temp = DeformConvParam(kernels, stride, pad, rates, num_groups, num_filter, true);
+    auto temp = DeformPoolParam(kernels, stride, pad, rates, num_groups, num_filter, pool_size, true);
     param_ = &temp;
     LayerSetUp(input_shape, offset_shape, out_backprop_shape);
     int M = kernel_dim_;
@@ -804,6 +754,7 @@ class DeformConvBackpropOp : public OpKernel {
       int num_kernels_im2col_;
       int num_kernels_col2im_;
       int num_groups;
+      int pool_size;
       bool bias_term_;  // has bias term?
       bool is_1x1_;
 
